@@ -125,7 +125,7 @@ elif choice == "Rilevazione sul Campo":
 elif choice == "Importa Master Data":
     st.title("📥 Caricamento Excel")
     st.info("Il sistema leggerà la colonna 1 come Nome e le altre come Barcode (8-13 cifre).")
-    up = st.file_upload("Carica file XLSX", type="xlsx")
+    up = st.file_uploader("Carica file XLSX", type="xlsx")
     if up:
         df = pd.read_excel(up)
         if st.button("Avvia Importazione Incrementale"):
