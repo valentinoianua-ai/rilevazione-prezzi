@@ -56,22 +56,39 @@ if scelta == "Importa Listino":
                         status_text.text(f"Elaborazione pagina {i+1} di {total_pages}...")
                         
                         testo = page.extract_text()
-                        if not testo or "INDICE" in testo.upper(): continue # SALTA L'INDICE
+                        if not testo or "INDICE" in testo.upper():
+                            continue 
                         
-                        blocchi = re.split(r'(\d{6})\n', testo) 
-                        for j in range(1, len(blocchi), 2):
-                            cod = blocchi[j]
-                            corpo = blocchi[j+1]
-                            
-                            # Estrazione con gestione errori per evitare crash
+                        # Dividiamo il testo in righe per un'analisi chirurgica
+                        righe = testo.split('\n')
+                        for riga in righe:
                             try:
-                                ean_m = re.search(r'EAN\s(\d{13})', corpo)
-                                cess_m = re.search(r'Cess\.\s(\d+,\d+)', corpo)
-                                if ean_m and cess_m:
-                                    # ... (logica di inserimento DB come prima) ...
-                                    count += 1
-                            except Exception:
-                                continue # Se una riga è corrotta, vai avanti senza fermarti
+                                # CERCA EAN: sequenza di 13 cifre
+                                ean_m = re.search(r'(\d{13})', riga)
+                                # CERCA PREZZO: cerca un formato numero,virgola,due cifre (es. 12,50)
+                                prezzo_m = re.search(r'(\d+,\d{2})', riga)
+                                
+                                if ean_m and prezzo_m:
+                                    ean = ean_m.group(1)
+                                    # Converte la virgola in punto per il database (es. 12,50 -> 12.50)
+                                    costo = float(prezzo_m.group(1).replace(',', '.'))
+                                    
+                                    # 1. Inserimento prodotto generico se non esiste
+                                    desc_placeholder = f"Prodotto {ean}"
+                                    cursor.execute("INSERT OR IGNORE INTO prodotti (descrizione) VALUES (?)", (desc_placeholder,))
+                                    cursor.execute("SELECT id_prodotto FROM prodotti WHERE descrizione = ?", (desc_placeholder,))
+                                    res = cursor.fetchone()
+                                    if res:
+                                        id_p = res[0]
+                                        # 2. Associazione Barcode
+                                        cursor.execute("INSERT OR IGNORE INTO barcode (ean, id_prodotto) VALUES (?, ?)", (ean, id_p))
+                                        # 3. Inserimento Listino
+                                        data_oggi = datetime.now().strftime('%Y-%m-%d')
+                                        cursor.execute("""INSERT INTO listini (id_prodotto, fornitore, costo_cessione, data) 
+                                                          VALUES (?, ?, ?, ?)""", (id_p, f_nome, costo, data_oggi))
+                                        count += 1
+                            except Exception as e:
+                                continue
                                 
                 conn.commit()
                 conn.close()
