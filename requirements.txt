@@ -4,3 +4,6 @@ openpyxl
 pdfplumber
 pydrive2
 google-api-python-client
+pytesseract
+pdf2image
+xlrd
