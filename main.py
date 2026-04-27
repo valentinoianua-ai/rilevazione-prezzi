@@ -1,63 +1,31 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-import pdfplumber
-import re
 import os
 from datetime import datetime
 
 # --- CONFIGURAZIONE ---
-st.set_page_config(page_title="Price Manager Pro", layout="wide")
-
-# Il nome del DB deve essere lo stesso che hai generato sul PC se vuoi che i dati coincidano
+st.set_page_config(page_title="Price Radar - Confronto Listini", layout="wide")
 DB_PATH = "database_rilevazioni.db"
 
 def get_connection():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def init_db():
-    conn = get_connection()
-    c = conn.cursor()
-    # Tabella Prodotti
-    c.execute('''CREATE TABLE IF NOT EXISTS prodotti 
-                 (id_prodotto INTEGER PRIMARY KEY AUTOINCREMENT, descrizione TEXT, peso TEXT, iva INTEGER DEFAULT 22)''')
-    # Tabella Barcode (EAN)
-    c.execute('''CREATE TABLE IF NOT EXISTS barcode 
-                 (ean TEXT PRIMARY KEY, id_prodotto INTEGER)''')
-    # Tabella Mappatura (Il ponte tra codice interno fornitore ed EAN)
-    c.execute('''CREATE TABLE IF NOT EXISTS mappatura_fornitori 
-                 (id_mappa INTEGER PRIMARY KEY AUTOINCREMENT, id_prodotto INTEGER, fornitore TEXT, codice_interno TEXT, UNIQUE(fornitore, codice_interno))''')
-    # Tabella Listini (I prezzi storici)
-    c.execute('''CREATE TABLE IF NOT EXISTS listini 
-                 (id_listino INTEGER PRIMARY KEY AUTOINCREMENT, id_prodotto INTEGER, fornitore TEXT, costo_cessione REAL, prezzo_suggerito REAL, data TEXT)''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# --- FUNZIONI DI SUPPORTO ---
-def salva_dato_completo(ean, codice_interno, fornitore, costo, descrizione=""):
+# --- NUOVA LOGICA DI SALVATAGGIO (Focus su Prezzi Rilevati) ---
+def salva_rilevazione(ean, descrizione, fornitore_punto_vendita, prezzo):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        # 1. Inserisci prodotto
-        cursor.execute("INSERT OR IGNORE INTO prodotti (descrizione) VALUES (?)", (descrizione or f"Prodotto {ean}",))
-        cursor.execute("SELECT id_prodotto FROM prodotti WHERE descrizione = ?", (descrizione or f"Prodotto {ean}",))
+        # 1. Gestione Prodotto ed EAN (La nostra Rosetta)
+        cursor.execute("INSERT OR IGNORE INTO prodotti (descrizione) VALUES (?)", (descrizione.upper(),))
+        cursor.execute("SELECT id_prodotto FROM prodotti WHERE descrizione = ?", (descrizione.upper(),))
         id_p = cursor.fetchone()[0]
-
-        # 2. Inserisci Barcode
         cursor.execute("INSERT OR IGNORE INTO barcode (ean, id_prodotto) VALUES (?, ?)", (ean, id_p))
-
-        # 3. Inserisci Mappatura Fornitore
-        if codice_interno:
-            cursor.execute("INSERT OR IGNORE INTO mappatura_fornitori (id_prodotto, fornitore, codice_interno) VALUES (?, ?, ?)", 
-                           (id_p, fornitore, str(codice_interno)))
-
-        # 4. Inserisci Listino
-        data_oggi = datetime.now().strftime('%Y-%m-%d')
-        cursor.execute("INSERT INTO listini (id_prodotto, fornitore, costo_cessione, data) VALUES (?, ?, ?, ?)", 
-                       (id_p, fornitore, costo, data_oggi))
         
+        # 2. Registrazione Prezzo (Che sia acquisto o scaffale Tigre/Oasi)
+        data_oggi = datetime.now().strftime('%Y-%m-%d')
+        cursor.execute("""INSERT INTO listini (id_prodotto, fornitore, costo_cessione, data) 
+                          VALUES (?, ?, ?, ?)""", (id_p, fornitore_punto_vendita, prezzo, data_oggi))
         conn.commit()
         return True
     except:
@@ -66,74 +34,70 @@ def salva_dato_completo(ean, codice_interno, fornitore, costo, descrizione=""):
         conn.close()
 
 # --- INTERFACCIA ---
-menu = ["Dashboard", "Importa Listino", "Gestione Sistema"]
+menu = ["📊 Dashboard Confronto", "📥 Importa Rilevazioni/Listini", "⚙️ Gestione Sistema"]
 scelta = st.sidebar.radio("Navigazione", menu)
 
-if scelta == "Importa Listino":
-    st.title("📥 Caricamento Listini (PDF o Excel)")
-    f_nome = st.text_input("Fornitore (es. Brendolan, Apulia)")
-    f_up = st.file_uploader("Carica il file (Excel o PDF)", type=["xlsx", "xls", "pdf"])
+if scelta == "📊 Dashboard Confronto":
+    st.title("🔎 Analisi Comparativa Prezzi")
+    st.write("Qui puoi confrontare i prezzi rilevati tra diversi punti vendita o listini.")
+
+    conn = get_connection()
+    # Carichiamo tutti i dati per creare una tabella pivot dinamica
+    query = """
+    SELECT b.ean, p.descrizione, l.fornitore, l.costo_cessione as prezzo, l.data
+    FROM listini l
+    JOIN prodotti p ON l.id_prodotto = p.id_prodotto
+    JOIN barcode b ON p.id_prodotto = b.id_prodotto
+    """
+    df_raw = pd.read_sql(query, conn)
+    conn.close()
+
+    if not df_raw.empty:
+        # Creiamo la tabella di confronto: righe = Prodotti, colonne = Fornitori/Concorrenti
+        df_pivot = df_raw.pivot_table(
+            index=['ean', 'descrizione'], 
+            columns='fornitore', 
+            values='prezzo', 
+            aggfunc='last'
+        ).reset_index()
+
+        # Evidenziamo il prezzo più basso (il positivo) tra le colonne dei fornitori
+        cols_fornitori = df_pivot.columns[2:]
+        st.dataframe(df_pivot.style.highlight_min(axis=1, subset=cols_fornitori, color='lightgreen'))
+
+        # --- EXCEL DI USCITA ---
+        if st.button("Genera File Excel di Confronto"):
+            file_output = "confronto_competitors.xlsx"
+            df_pivot.to_excel(file_output, index=False)
+            with open(file_output, "rb") as f:
+                st.download_button("📥 Scarica Excel", f, file_name=file_output)
+    else:
+        st.info("Carica dei dati per visualizzare il confronto.")
+
+elif scelta == "📥 Importa Rilevazioni/Listini":
+    st.title("📥 Caricamento Dati (Excel)")
+    f_nome = st.text_input("Origine Dati (es. Tigre, Oasi, Brendolan)")
+    f_up = st.file_uploader("Carica Excel", type=["xlsx", "xls"])
 
     if f_up and f_nome:
-        # --- CASO EXCEL ---
-        if f_up.name.endswith(('.xlsx', '.xls')):
-            st.info("Rilevato file Excel. Cerco colonne Codice, EAN e Prezzo...")
-            df = pd.read_excel(f_up)
-            st.dataframe(df.head())
-            
-            col_codice = st.selectbox("Seleziona colonna Codice Interno", df.columns)
-            col_ean = st.selectbox("Seleziona colonna EAN (se esiste, altrimenti seleziona Codice)", df.columns)
-            col_prezzo = st.selectbox("Seleziona colonna Prezzo/Costo", df.columns)
+        df = pd.read_excel(f_up)
+        c1, c2, c3 = st.columns(3)
+        with c1: ean_col = st.selectbox("Colonna EAN", df.columns)
+        with c2: desc_col = st.selectbox("Colonna Descrizione", df.columns)
+        with c3: prz_col = st.selectbox("Colonna Prezzo", df.columns)
 
-            if st.button("Elabora Excel"):
-                successi = 0
-                for _, row in df.iterrows():
-                    res = salva_dato_completo(
-                        ean=str(row[col_ean]), 
-                        codice_interno=str(row[col_codice]), 
-                        fornitore=f_nome, 
-                        costo=float(str(row[col_prezzo]).replace(',', '.'))
-                    )
-                    if res: successi += 1
-                st.success(f"Excel elaborato! Inseriti {successi} prodotti.")
+        if st.button("Importa Dati"):
+            count = 0
+            for _, row in df.iterrows():
+                if salva_rilevazione(row[ean_col], row[desc_col], f_nome, float(row[prz_col])):
+                    count += 1
+            st.success(f"Importate {count} rilevazioni per {f_nome}")
 
-        # --- CASO PDF ---
-        elif f_up.name.endswith(".pdf"):
-            if st.button(f"Avvia Scansione PDF ({f_nome})"):
-                count = 0
-                with pdfplumber.open(f_up) as pdf:
-                    for page in pdf.pages:
-                        testo = page.extract_text()
-                        if not testo: continue
-                        
-                        for riga in testo.split('\n'):
-                            ean_m = re.search(r'(\d{13})', riga)
-                            prezzo_m = re.search(r'(\d+,\d{2})', riga)
-                            # Cerchiamo anche un codice interno opzionale a 6 cifre
-                            cod_int_m = re.search(r'\b(\d{6})\b', riga)
-                            
-                            if ean_m and prezzo_m:
-                                ean = ean_m.group(1)
-                                costo = float(prezzo_m.group(1).replace(',', '.'))
-                                cod_int = cod_int_m.group(1) if cod_int_m else None
-                                
-                                if salva_dato_completo(ean, cod_int, f_nome, costo):
-                                    count += 1
-                st.success(f"PDF elaborato! Caricati {count} record.")
-
-elif scelta == "Gestione Sistema":
-    st.title("⚙️ Amministrazione")
-    
-    # Upload del DB generato offline
-    st.subheader("Aggiorna Memoria di Sistema")
-    db_file = st.file_uploader("Carica il file mappatura_brendolan.db generato sul PC", type=["db"])
-    if db_file:
+elif scelta == "⚙️ Gestione Sistema":
+    st.title("⚙️ Rosetta & Backup")
+    # Qui carichi il famoso .db generato col PC per Brendolan
+    up_db = st.file_uploader("Aggiorna Database (.db)", type=["db"])
+    if up_db:
         with open(DB_PATH, "wb") as f:
-            f.write(db_file.getbuffer())
-        st.success("Database di mappatura aggiornato con successo!")
-
-    st.divider()
-    
-    if os.path.exists(DB_PATH):
-        with open(DB_PATH, "rb") as f:
-            st.download_button("📥 Scarica Database Attuale", f, file_name="database_prezzi.db")
+            f.write(up_db.getbuffer())
+        st.success("Database aggiornato!")
