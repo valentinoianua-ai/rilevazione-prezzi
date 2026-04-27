@@ -7,7 +7,7 @@ import os
 from datetime import datetime
 
 # --- CONFIGURAZIONE PAGINA ---
-st.set_page_config(page_title="OmniPrice Hub v2", layout="wide")
+st.set_page_config(page_title="OmniPrice Hub v2.1", layout="wide")
 DB_PATH = "master_price_archive.db"
 
 # --- FUNZIONI DATABASE ---
@@ -33,37 +33,39 @@ def init_db():
 
 init_db()
 
-# --- MOTORE INCREMENTALE (Il cuore del sistema) ---
+# --- MOTORE INCREMENTALE ---
 def salva_dato_incrementale(ean, descrizione, fornitore, data, p_ing=None, p_cons=None, p_scaf=None, cod_int=None, iva=22):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        ean = str(ean).strip()
-        desc = descrizione.upper().strip() if descrizione else f"PRODOTTO {ean}"
+        # Pulizia EAN da possibili decimali di Excel (es. 800123.0 -> 800123)
+        ean_clean = str(ean).split('.')[0].strip()
+        if not ean_clean or ean_clean == 'nan': return False
         
-        # Inserimento/Aggiornamento Anagrafica: non sovrascrive descrizioni reali con "PRODOTTO X"
+        desc = descrizione.upper().strip() if descrizione and str(descrizione) != 'nan' else f"PRODOTTO {ean_clean}"
+        
+        # Inserimento/Aggiornamento Anagrafica
         cursor.execute("""
             INSERT INTO prodotti (ean, descrizione, iva) VALUES (?, ?, ?)
             ON CONFLICT(ean) DO UPDATE SET 
             descrizione = CASE WHEN descrizione LIKE 'PRODOTTO %' OR descrizione = '' THEN excluded.descrizione ELSE descrizione END,
             iva = COALESCE(excluded.iva, iva)
-        """, (ean, desc, iva))
+        """, (ean_clean, desc, iva))
 
         # Aggiornamento Mappatura Codici Interni
         if cod_int:
             cursor.execute("INSERT OR IGNORE INTO mappatura (ean, fornitore, codice_interno) VALUES (?, ?, ?)", 
-                           (ean, fornitore, str(cod_int)))
+                           (ean_clean, fornitore, str(cod_int).split('.')[0]))
 
-        # Registrazione della rilevazione specifica
+        # Registrazione della rilevazione
         cursor.execute("""
             INSERT INTO rilevazioni (ean, fornitore_punto, prezzo_ingrosso, prezzo_consigliato, prezzo_scaffale, data)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (ean, fornitore, p_ing, p_cons, p_scaf, data))
+        """, (ean_clean, fornitore, p_ing, p_cons, p_scaf, data))
         
         conn.commit()
         return True
     except Exception as e:
-        st.error(f"Errore nel salvataggio EAN {ean}: {e}")
         return False
     finally:
         conn.close()
@@ -87,8 +89,7 @@ if scelta == "📊 Dashboard Analisi":
     conn.close()
 
     if not df_raw.empty:
-        st.write("Confronto dinamico dei prezzi rilevati:")
-        tab1, tab2 = st.tabs(["🛒 Confronto Scaffale (Tigre/Oasi/Mio)", "📦 Confronto Acquisti (Ingrosso)"])
+        tab1, tab2 = st.tabs(["🛒 Confronto Scaffale", "📦 Confronto Acquisti"])
         
         with tab1:
             p_scaffale = df_raw.pivot_table(index=['ean', 'descrizione'], columns='fornitore_punto', values='prezzo_scaffale', aggfunc='last')
@@ -98,45 +99,42 @@ if scelta == "📊 Dashboard Analisi":
             p_ingrosso = df_raw.pivot_table(index=['ean', 'descrizione'], columns='fornitore_punto', values='prezzo_ingrosso', aggfunc='last')
             st.dataframe(p_ingrosso.style.highlight_min(axis=1, color='lightblue'))
 
-        if st.button("🚀 Esporta Report Excel Completo"):
-            file_rep = "Report_Prezzi_OmniPrice.xlsx"
+        if st.button("🚀 Esporta Report Excel"):
+            file_rep = "Analisi_OmniPrice.xlsx"
             with pd.ExcelWriter(file_rep) as writer:
                 p_scaffale.to_excel(writer, sheet_name="Scaffale")
                 p_ingrosso.to_excel(writer, sheet_name="Ingrosso")
             st.download_button("Scarica Excel", data=open(file_rep, "rb"), file_name=file_rep)
     else:
-        st.info("Nessun dato presente. Carica listini o rilevazioni per iniziare.")
+        st.info("Nessun dato presente. Carica listini o rilevazioni.")
 
-# --- 2. IMPORTAZIONE DATI (Excel e PDF) ---
+# --- 2. IMPORTAZIONE DATI (LISTINI/SCAFFALE) ---
 elif scelta == "📥 Importazione Dati":
     st.title("📥 Caricamento Flussi")
-    f_nome = st.text_input("Origine Dati (es. Tigre, Brendolan, Mio Negozio)")
-    f_up = st.file_uploader("Carica file Excel o PDF", type=["xlsx", "xls", "pdf"])
+    f_nome = st.text_input("Origine Dati (es. Tigre, Brendolan, Mio)")
+    f_up = st.file_uploader("Carica Excel o PDF", type=["xlsx", "xls", "pdf"])
     
     if f_up and f_nome:
-        # GESTIONE EXCEL
         if f_up.name.endswith(('.xlsx', '.xls')):
             df = pd.read_excel(f_up)
-            st.write("Mappa le colonne del file Excel:")
+            st.write("Mappa le colonne:")
             c1, c2, c3, c4 = st.columns(4)
-            with c1: ean_col = st.selectbox("Colonna EAN", df.columns)
-            with c2: desc_col = st.selectbox("Colonna Descrizione", df.columns)
+            with c1: ean_col = st.selectbox("EAN", df.columns)
+            with c2: desc_col = st.selectbox("Descrizione", df.columns)
             with c3: ing_col = st.selectbox("Costo Ingrosso", ["Assente"] + list(df.columns))
             with c4: scaf_col = st.selectbox("Prezzo Scaffale", ["Assente"] + list(df.columns))
             
-            if st.button("Importa Excel nel Database"):
+            if st.button("Importa Excel"):
                 data_oggi = datetime.now().strftime('%Y-%m-%d')
                 count = 0
                 for _, row in df.iterrows():
-                    p_ing = float(row[ing_col]) if ing_col != "Assente" else None
-                    p_scaf = float(row[scaf_col]) if scaf_col != "Assente" else None
+                    p_ing = float(row[ing_col]) if ing_col != "Assente" and pd.notnull(row[ing_col]) else None
+                    p_scaf = float(row[scaf_col]) if scaf_col != "Assente" and pd.notnull(row[scaf_col]) else None
                     if salva_dato_incrementale(row[ean_col], row[desc_col], f_nome, data_oggi, p_ing=p_ing, p_scaf=p_scaf):
                         count += 1
-                st.success(f"Importazione completata: {count} prodotti caricati!")
+                st.success(f"Caricati {count} prodotti!")
 
-        # GESTIONE PDF (Ripristinata)
         elif f_up.name.endswith(".pdf"):
-            st.warning("La scansione PDF cerca EAN e Prezzi (formato 0,00).")
             if st.button("Avvia Scansione PDF"):
                 count = 0
                 data_oggi = datetime.now().strftime('%Y-%m-%d')
@@ -152,42 +150,53 @@ elif scelta == "📥 Importazione Dati":
                                 prezzo = float(prezzo_m.group(1).replace(',', '.'))
                                 if salva_dato_incrementale(ean, None, f_nome, data_oggi, p_scaf=prezzo):
                                     count += 1
-                st.success(f"Scansione PDF conclusa: {count} record estratti!")
+                st.success(f"PDF analizzato: {count} prodotti trovati!")
 
-# --- 3. GESTIONE ARCHIVIO & ROSETTA ---
+# --- 3. ARCHIVIO CORPOSO & ROSETTA ---
 elif scelta == "🗂️ Gestione Archivio & Rosetta":
     st.title("⚙️ Centro Gestione Dati Storici")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("📚 Archivio Corposo (Anagrafica)")
-        st.write("Carica il tuo Excel maestro (Codice Interno, Descrizione, EAN multipli).")
+        st.subheader("📚 Archivio Corposo (Multi-EAN)")
+        st.write("Col A: Codice | Col B: Descrizione | Col C+: EAN multipli")
         f_arch = st.file_uploader("Upload Excel Archivio", type=["xlsx"])
+        
         if f_arch:
-            df_a = pd.read_excel(f_arch)
-            c1, c2, c3 = st.columns(3)
-            col_ean = c1.selectbox("Colonna EAN", df_a.columns)
-            col_desc = c2.selectbox("Colonna Descrizione", df_a.columns)
-            col_cod = c3.selectbox("Colonna Codice Interno", df_a.columns)
+            df_a = pd.read_excel(f_arch, header=None) # Header=None per gestire indici fissi (0, 1, 2+)
+            st.write("Anteprima (prime 3 righe):")
+            st.dataframe(df_a.head(3))
             
             if st.button("Sincronizza Archivio Maestro"):
                 data_oggi = datetime.now().strftime('%Y-%m-%d')
-                for _, row in df_a.iterrows():
-                    salva_dato_incrementale(row[col_ean], row[col_desc], "ARCHIVIO", data_oggi, cod_int=row[col_cod])
-                st.success("Archivio sincronizzato con successo!")
+                count_prod = 0
+                count_ean = 0
+                for index, row in df_a.iterrows():
+                    # Salta eventuale riga di intestazione se contiene testo
+                    if index == 0 and "Codice" in str(row[0]): continue
+                    
+                    cod_int = str(row[0])
+                    descrizione = str(row[1])
+                    
+                    # Prende tutte le colonne dalla 3a in poi come EAN, ignorando i vuoti
+                    ean_list = row.iloc[2:].dropna()
+                    
+                    for ean in ean_list:
+                        if salva_dato_incrementale(ean, descrizione, "ARCHIVIO", data_oggi, cod_int=cod_int):
+                            count_ean += 1
+                    count_prod += 1
+                st.success(f"Sincronizzazione completata! Articoli elaborati: {count_prod}. EAN associati: {count_ean}")
 
     with col2:
         st.subheader("🌩️ Rosetta & Cloud Sync")
-        st.write("Usa queste funzioni per non perdere i dati su Google Cloud.")
-        
-        up_db = st.file_uploader("Ripristina Database (.db)", type=["db"])
+        up_db = st.file_uploader("Ripristina Backup .db", type=["db"])
         if up_db:
             with open(DB_PATH, "wb") as f:
                 f.write(up_db.getbuffer())
-            st.success("Database ripristinato correttamente!")
+            st.success("Database ripristinato!")
         
         st.divider()
         if os.path.exists(DB_PATH):
             with open(DB_PATH, "rb") as f:
-                st.download_button("📥 Scarica Backup Database Attuale", f, file_name="master_price_archive.db")
+                st.download_button("📥 Scarica Backup Database", f, file_name="master_price_archive.db")
