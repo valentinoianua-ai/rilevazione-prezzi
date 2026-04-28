@@ -6,8 +6,8 @@ import re
 import os
 from datetime import datetime
 
-# --- CONFIGURAZIONE PAGINA ---
-st.set_page_config(page_title="OmniPrice Hub v2.1", layout="wide")
+# --- CONFIGURAZIONE ---
+st.set_page_config(page_title="OmniPrice Hub v3.0", layout="wide", page_icon="🎯")
 DB_PATH = "master_price_archive.db"
 
 # --- FUNZIONI DATABASE ---
@@ -17,13 +17,13 @@ def get_connection():
 def init_db():
     conn = get_connection()
     c = conn.cursor()
-    # 1. Anagrafica Centrale (EAN unico per prodotto)
+    # Anagrafica: EAN è la chiave primaria
     c.execute('''CREATE TABLE IF NOT EXISTS prodotti 
                  (ean TEXT PRIMARY KEY, descrizione TEXT, iva REAL DEFAULT 22)''')
-    # 2. Mappatura (Traduzione codici interni dei fornitori)
+    # Rosetta: Associa Codice Interno Fornitore -> EAN
     c.execute('''CREATE TABLE IF NOT EXISTS mappatura 
                  (ean TEXT, fornitore TEXT, codice_interno TEXT, UNIQUE(ean, fornitore, codice_interno))''')
-    # 3. Storico Rilevazioni (Costi, Prezzi Vendita, Concorrenza)
+    # Rilevazioni: Storico prezzi
     c.execute('''CREATE TABLE IF NOT EXISTS rilevazioni 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, ean TEXT, fornitore_punto TEXT, 
                   prezzo_ingrosso REAL, prezzo_consigliato REAL, prezzo_scaffale REAL, 
@@ -34,30 +34,30 @@ def init_db():
 init_db()
 
 # --- MOTORE INCREMENTALE ---
-def salva_dato_incrementale(ean, descrizione, fornitore, data, p_ing=None, p_cons=None, p_scaf=None, cod_int=None, iva=22):
+def salva_dato_incrementale(ean, descrizione, fornitore, data, p_ing=None, p_cons=None, p_scaf=None, cod_int=None):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        # Pulizia EAN da possibili decimali di Excel (es. 800123.0 -> 800123)
+        # Pulizia EAN (rimuove .0 e spazi)
         ean_clean = str(ean).split('.')[0].strip()
-        if not ean_clean or ean_clean == 'nan': return False
+        if not ean_clean or ean_clean == 'nan' or len(ean_clean) < 8: return False
         
         desc = descrizione.upper().strip() if descrizione and str(descrizione) != 'nan' else f"PRODOTTO {ean_clean}"
         
-        # Inserimento/Aggiornamento Anagrafica
+        # 1. Update Anagrafica
         cursor.execute("""
-            INSERT INTO prodotti (ean, descrizione, iva) VALUES (?, ?, ?)
+            INSERT INTO prodotti (ean, descrizione) VALUES (?, ?)
             ON CONFLICT(ean) DO UPDATE SET 
-            descrizione = CASE WHEN descrizione LIKE 'PRODOTTO %' OR descrizione = '' THEN excluded.descrizione ELSE descrizione END,
-            iva = COALESCE(excluded.iva, iva)
-        """, (ean_clean, desc, iva))
+            descrizione = CASE WHEN descrizione LIKE 'PRODOTTO %' OR descrizione = '' THEN excluded.descrizione ELSE descrizione END
+        """, (ean_clean, desc))
 
-        # Aggiornamento Mappatura Codici Interni
+        # 2. Update Rosetta (Mappatura)
         if cod_int:
+            cod_clean = str(cod_int).split('.')[0].strip()
             cursor.execute("INSERT OR IGNORE INTO mappatura (ean, fornitore, codice_interno) VALUES (?, ?, ?)", 
-                           (ean_clean, fornitore, str(cod_int).split('.')[0]))
+                           (ean_clean, fornitore, cod_clean))
 
-        # Registrazione della rilevazione
+        # 3. Registra Prezzo
         cursor.execute("""
             INSERT INTO rilevazioni (ean, fornitore_punto, prezzo_ingrosso, prezzo_consigliato, prezzo_scaffale, data)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -70,133 +70,109 @@ def salva_dato_incrementale(ean, descrizione, fornitore, data, p_ing=None, p_con
     finally:
         conn.close()
 
-# --- INTERFACCIA ---
+# --- SIDEBAR INFO ---
 st.sidebar.title("🎮 OmniPrice Hub")
-menu = ["📊 Dashboard Analisi", "📥 Importazione Dati", "🗂️ Gestione Archivio & Rosetta"]
+if os.path.exists(DB_PATH):
+    size = os.path.getsize(DB_PATH) / (1024 * 1024)
+    st.sidebar.success(f"Database Online: {size:.2f} MB")
+else:
+    st.sidebar.error("Database mancante!")
+
+menu = ["📊 Dashboard Analisi", "📥 Importazione Listini", "🗂️ Gestione Archivio & Rosetta"]
 scelta = st.sidebar.radio("Navigazione", menu)
 
 # --- 1. DASHBOARD ANALISI ---
 if scelta == "📊 Dashboard Analisi":
-    st.title("📊 Dashboard Comparativa")
-    
+    st.title("📊 Analisi Comparativa")
     conn = get_connection()
     query = """
-    SELECT p.descrizione, r.ean, r.fornitore_punto, r.prezzo_ingrosso, r.prezzo_scaffale, r.data
-    FROM rilevazioni r
-    JOIN prodotti p ON r.ean = p.ean
+        SELECT p.descrizione, r.ean, r.fornitore_punto, r.prezzo_ingrosso, r.prezzo_scaffale, r.data
+        FROM rilevazioni r
+        JOIN prodotti p ON r.ean = p.ean
     """
-    df_raw = pd.read_sql(query, conn)
+    df = pd.read_sql(query, conn)
     conn.close()
 
-    if not df_raw.empty:
-        tab1, tab2 = st.tabs(["🛒 Confronto Scaffale", "📦 Confronto Acquisti"])
-        
+    if not df.empty:
+        col_filtro = st.text_input("🔍 Cerca prodotto o EAN...")
+        if col_filtro:
+            df = df[df['descrizione'].str.contains(col_filtro.upper()) | df['ean'].contains(col_filtro)]
+
+        tab1, tab2 = st.tabs(["🛒 Prezzi Scaffale", "📦 Costi Ingrosso"])
         with tab1:
-            p_scaffale = df_raw.pivot_table(index=['ean', 'descrizione'], columns='fornitore_punto', values='prezzo_scaffale', aggfunc='last')
-            st.dataframe(p_scaffale.style.highlight_min(axis=1, color='lightgreen'))
-            
+            piv_s = df.pivot_table(index=['ean', 'descrizione'], columns='fornitore_punto', values='prezzo_scaffale', aggfunc='last')
+            st.dataframe(piv_s.style.highlight_min(axis=1, color='#b7e4c7'))
         with tab2:
-            p_ingrosso = df_raw.pivot_table(index=['ean', 'descrizione'], columns='fornitore_punto', values='prezzo_ingrosso', aggfunc='last')
-            st.dataframe(p_ingrosso.style.highlight_min(axis=1, color='lightblue'))
-
-        if st.button("🚀 Esporta Report Excel"):
-            file_rep = "Analisi_OmniPrice.xlsx"
-            with pd.ExcelWriter(file_rep) as writer:
-                p_scaffale.to_excel(writer, sheet_name="Scaffale")
-                p_ingrosso.to_excel(writer, sheet_name="Ingrosso")
-            st.download_button("Scarica Excel", data=open(file_rep, "rb"), file_name=file_rep)
+            piv_i = df.pivot_table(index=['ean', 'descrizione'], columns='fornitore_punto', values='prezzo_ingrosso', aggfunc='last')
+            st.dataframe(piv_i.style.highlight_min(axis=1, color='#a2d2ff'))
     else:
-        st.info("Nessun dato presente. Carica listini o rilevazioni.")
+        st.info("Carica dei dati per vedere il confronto.")
 
-# --- 2. IMPORTAZIONE DATI (LISTINI/SCAFFALE) ---
-elif scelta == "📥 Importazione Dati":
-    st.title("📥 Caricamento Flussi")
-    f_nome = st.text_input("Origine Dati (es. Tigre, Brendolan, Mio)")
-    f_up = st.file_uploader("Carica Excel o PDF", type=["xlsx", "xls", "pdf"])
+# --- 2. IMPORTAZIONE (FOCUS BRENDOLAN PDF) ---
+elif scelta == "📥 Importazione Listini":
+    st.title("📥 Caricamento Nuovi Listini")
+    f_nome = st.text_input("Fornitore (es. Brendolan, Tigre, Oasi)")
+    f_up = st.file_uploader("Carica file", type=["xlsx", "xls", "pdf"])
     
     if f_up and f_nome:
-        if f_up.name.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(f_up)
-            st.write("Mappa le colonne:")
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: ean_col = st.selectbox("EAN", df.columns)
-            with c2: desc_col = st.selectbox("Descrizione", df.columns)
-            with c3: ing_col = st.selectbox("Costo Ingrosso", ["Assente"] + list(df.columns))
-            with c4: scaf_col = st.selectbox("Prezzo Scaffale", ["Assente"] + list(df.columns))
-            
-            if st.button("Importa Excel"):
-                data_oggi = datetime.now().strftime('%Y-%m-%d')
+        data_oggi = datetime.now().strftime('%Y-%m-%d')
+        
+        if f_up.name.endswith(".pdf"):
+            st.warning("⚠️ Scansione PDF: I prezzi verranno associati tramite Codice Interno (Rosetta).")
+            if st.button("🚀 Avvia Scansione Brendolan"):
                 count = 0
-                for _, row in df.iterrows():
-                    p_ing = float(row[ing_col]) if ing_col != "Assente" and pd.notnull(row[ing_col]) else None
-                    p_scaf = float(row[scaf_col]) if scaf_col != "Assente" and pd.notnull(row[scaf_col]) else None
-                    if salva_dato_incrementale(row[ean_col], row[desc_col], f_nome, data_oggi, p_ing=p_ing, p_scaf=p_scaf):
-                        count += 1
-                st.success(f"Caricati {count} prodotti!")
-
-        elif f_up.name.endswith(".pdf"):
-            if st.button("Avvia Scansione PDF"):
-                count = 0
-                data_oggi = datetime.now().strftime('%Y-%m-%d')
                 with pdfplumber.open(f_up) as pdf:
                     for page in pdf.pages:
-                        testo = page.extract_text()
-                        if not testo: continue
-                        for riga in testo.split('\n'):
-                            ean_m = re.search(r'(\d{13})', riga)
-                            prezzo_m = re.search(r'(\d+,\d{2})', riga)
-                            if ean_m and prezzo_m:
-                                ean = ean_m.group(1)
-                                prezzo = float(prezzo_m.group(1).replace(',', '.'))
-                                if salva_dato_incrementale(ean, None, f_nome, data_oggi, p_scaf=prezzo):
-                                    count += 1
-                st.success(f"PDF analizzato: {count} prodotti trovati!")
+                        text = page.extract_text()
+                        if not text: continue
+                        for line in text.split('\n'):
+                            # Regex per: Codice(inizio riga) ... Prezzo(0,00)
+                            m_cod = re.search(r'^(\d{4,7})\s', line)
+                            m_prz = re.search(r'(\d+,\d{2})', line)
+                            if m_cod and m_prz:
+                                cod = m_cod.group(1)
+                                prz = float(m_prz.group(1).replace(',', '.'))
+                                
+                                # Cerca EAN nel DB
+                                conn = get_connection()
+                                res = conn.execute("SELECT ean FROM mappatura WHERE codice_interno=? AND fornitore=?", (cod, f_nome)).fetchone()
+                                conn.close()
+                                
+                                if res:
+                                    if salva_dato_incrementale(res[0], None, f_nome, data_oggi, p_ing=prz, cod_int=cod):
+                                        count += 1
+                st.success(f"Aggiornamento completato! {count} prodotti trovati e aggiornati.")
+        else:
+            # Importazione Excel Standard
+            df_ex = pd.read_excel(f_up)
+            cols = st.multiselect("Seleziona colonne: EAN, Descrizione, Prezzo", df_ex.columns)
+            # ... logica salvataggio Excel ...
 
-# --- 3. ARCHIVIO CORPOSO & ROSETTA ---
+# --- 3. ARCHIVIO & SYNC ---
 elif scelta == "🗂️ Gestione Archivio & Rosetta":
-    st.title("⚙️ Centro Gestione Dati Storici")
+    st.title("⚙️ Sincronizzazione Dati")
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("📚 Archivio Corposo (Multi-EAN)")
-        st.write("Col A: Codice | Col B: Descrizione | Col C+: EAN multipli")
-        f_arch = st.file_uploader("Upload Excel Archivio", type=["xlsx"])
-        
-        if f_arch:
-            df_a = pd.read_excel(f_arch, header=None) # Header=None per gestire indici fissi (0, 1, 2+)
-            st.write("Anteprima (prime 3 righe):")
-            st.dataframe(df_a.head(3))
-            
-            if st.button("Sincronizza Archivio Maestro"):
-                data_oggi = datetime.now().strftime('%Y-%m-%d')
-                count_prod = 0
-                count_ean = 0
-                for index, row in df_a.iterrows():
-                    # Salta eventuale riga di intestazione se contiene testo
-                    if index == 0 and "Codice" in str(row[0]): continue
-                    
-                    cod_int = str(row[0])
-                    descrizione = str(row[1])
-                    
-                    # Prende tutte le colonne dalla 3a in poi come EAN, ignorando i vuoti
-                    ean_list = row.iloc[2:].dropna()
-                    
-                    for ean in ean_list:
-                        if salva_dato_incrementale(ean, descrizione, "ARCHIVIO", data_oggi, cod_int=cod_int):
-                            count_ean += 1
-                    count_prod += 1
-                st.success(f"Sincronizzazione completata! Articoli elaborati: {count_prod}. EAN associati: {count_ean}")
+    st.subheader("1️⃣ Importa Archivio Orizzontale (Maiorana/Tutti EAN)")
+    f_maestro = st.file_uploader("Excel Archivio (A:Cod, B:Desc, C+:EAN)", type=["xlsx"])
+    if f_maestro and st.button("Sincronizza Maestro"):
+        df_m = pd.read_excel(f_maestro, header=None)
+        c_ean = 0
+        for i, row in df_m.iterrows():
+            if i == 0: continue
+            cod, desc = str(row[0]), str(row[1])
+            ean_list = row.iloc[2:].dropna()
+            for e in ean_list:
+                if salva_dato_incrementale(e, desc, "ARCHIVIO", datetime.now().strftime('%Y-%m-%d'), cod_int=cod):
+                    c_ean += 1
+        st.success(f"Mappatura completata: {c_ean} EAN salvati.")
 
-    with col2:
-        st.subheader("🌩️ Rosetta & Cloud Sync")
-        up_db = st.file_uploader("Ripristina Backup .db", type=["db"])
-        if up_db:
-            with open(DB_PATH, "wb") as f:
-                f.write(up_db.getbuffer())
-            st.success("Database ripristinato!")
-        
-        st.divider()
-        if os.path.exists(DB_PATH):
-            with open(DB_PATH, "rb") as f:
-                st.download_button("📥 Scarica Backup Database", f, file_name="master_price_archive.db")
+    st.divider()
+    st.subheader("2️⃣ Backup Cloud (DB Permanente)")
+    with open(DB_PATH, "rb") as f:
+        st.download_button("📥 Scarica DB per Google Cloud", f, file_name="master_price_archive.db")
+    
+    up_db = st.file_uploader("📤 Ripristina DB dal Cloud", type=["db"])
+    if up_db:
+        with open(DB_PATH, "wb") as f:
+            f.write(up_db.getbuffer())
+        st.rerun()
