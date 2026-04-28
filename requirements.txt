@@ -3,7 +3,9 @@ pandas
 openpyxl
 pdfplumber
 pydrive2
-google-api-python-client
 pytesseract
 pdf2image
 xlrd
+google-api-python-client
+google-cloud-storage
+google-auth
