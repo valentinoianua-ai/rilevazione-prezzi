@@ -4,15 +4,14 @@ import sqlite3
 import pdfplumber
 import re
 import io
+import os
 from datetime import datetime
 from google.oauth2 import service_account
 from google.cloud import storage
 
-# --- CONFIGURAZIONE ---
+# --- CONFIGURAZIONE CLOUD STORAGE ---
 BUCKET_NAME = "Archivio Anagrafe EAN"
-DB_LOCAL_PATH = "/tmp/database_prezzi_v4.db"
-
-# [Le funzioni get_gcs_client, download_db, upload_db rimangono identiche a prima]
+DB_LOCAL_PATH = "/tmp/database_prezzi_vfinal.db"
 
 def get_gcs_client():
     if "gcp_service_account" in st.secrets:
@@ -32,79 +31,128 @@ def download_db():
 def upload_db():
     client = get_gcs_client()
     if client:
-        bucket = client.bucket(BUCKET_NAME)
-        blob = bucket.blob("database_prezzi.db")
-        blob.upload_from_filename(DB_LOCAL_PATH)
+        try:
+            bucket = client.bucket(BUCKET_NAME)
+            blob = bucket.blob("database_prezzi.db")
+            blob.upload_from_filename(DB_LOCAL_PATH)
+        except: st.error("Errore sincronizzazione Cloud")
 
-download_db()
+# Inizializzazione
+if not os.path.exists(DB_LOCAL_PATH): download_db()
 conn = sqlite3.connect(DB_LOCAL_PATH, check_same_thread=False)
 
-# --- AGGIUNTA FUNZIONI DI EXPORT EXCEL ---
+def init_db():
+    c = conn.cursor()
+    c.execute('CREATE TABLE IF NOT EXISTS prodotti (ean TEXT PRIMARY KEY, descrizione TEXT, data_immissione TEXT, iva TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS mappatura (ean TEXT, fornitore TEXT, codice_interno TEXT, UNIQUE(ean, fornitore, codice_interno))')
+    c.execute('CREATE TABLE IF NOT EXISTS listini (id INTEGER PRIMARY KEY AUTOINCREMENT, ean TEXT, fornitore TEXT, prezzo REAL, prezzo_consigliato REAL, data_listino TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS rilevazioni (id INTEGER PRIMARY KEY AUTOINCREMENT, ean TEXT, punto_vendita TEXT, prezzo_scaffale REAL, data_rilevazione TEXT)')
+    conn.commit()
 
-def to_excel_rilevazioni(df):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='Rilevazioni')
-    return output.getvalue()
+init_db()
 
-def to_excel_comparazione(df_pivot):
+def export_excel(df, sheet_name="Dati"):
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df_pivot.to_excel(writer, sheet_name='Comparazione')
-        workbook  = writer.book
-        worksheet = writer.sheets['Comparazione']
-        
-        # Formato per evidenziare il prezzo minimo (il più conveniente)
-        format_best = workbook.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})
-        
-        # Applichiamo una formattazione condizionale sulle colonne dei fornitori
-        num_rows = len(df_pivot)
-        num_cols = len(df_pivot.columns)
-        worksheet.conditional_format(1, 2, num_rows, num_cols + 1, 
-                                     {'type': 'bottom', 'value': 1, 'format': format_best})
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
     return output.getvalue()
 
 # --- INTERFACCIA ---
-st.set_page_config(page_title="OmniPrice Hub v4", layout="wide")
-
-# [Logica Password e Menu...]
+st.set_page_config(page_title="OmniPrice Hub v5", layout="wide")
+st.sidebar.title("🎮 OmniPrice Cloud")
 pwd = st.sidebar.text_input("Password", type="password")
+
 if pwd == st.secrets.get("password", "V@l3nt!n0"):
-    menu = ["📊 Report & Export", "🛒 Rilevazione", "📥 Import Listini", "⚙️ Rosetta"]
+    menu = ["📊 Report & Export", "🛒 Rilevazione Scaffale", "📥 Import Listini", "⚙️ Rosetta"]
     scelta = st.sidebar.radio("Naviga", menu)
 
+    # 1. REPORT & EXPORT
     if scelta == "📊 Report & Export":
-        st.title("📊 Produzione Report Excel")
+        st.title("📊 Estrazione Dati e Comparazione")
         
-        tab1, tab2 = st.tabs(["📄 Export Rilevazioni", "🆚 Comparazione Listini"])
+        t1, t2 = st.tabs(["📄 Export Rilevato", "🆚 Comparazione Listini"])
         
-        with tab1:
-            st.subheader("Scarica storico rilevazioni a scaffale")
+        with t1:
+            st.subheader("Storico Rilevazioni Punti Vendita")
             df_ril = pd.read_sql("""
-                SELECT p.descrizione, r.ean, r.punto_vendita, r.prezzo_scaffale, r.data_rilevazione 
+                SELECT r.data_rilevazione as Data, r.ean as EAN, p.descrizione as Prodotto, 
+                       r.punto_vendita as Negozio, r.prezzo_scaffale as Prezzo_Rilevato
                 FROM rilevazioni r JOIN prodotti p ON r.ean = p.ean
+                ORDER BY r.data_rilevazione DESC
             """, conn)
             if not df_ril.empty:
                 st.dataframe(df_ril)
-                st.download_button("📥 Scarica Excel Rilevato", to_excel_rilevazioni(df_ril), "rilevazioni_prezzi.xlsx")
-            else: st.info("Nessuna rilevazione presente.")
+                st.download_button("📥 Scarica Excel Rilevazioni", export_excel(df_ril, "Rilevato"), "rilevazioni.xlsx")
+            else: st.info("Nessuna rilevazione salvata.")
 
-        with tab2:
-            st.subheader("Confronto tra Listini Fornitori")
-            # Prendiamo solo l'ultimo prezzo caricato per ogni fornitore/EAN
+        with t2:
+            st.subheader("Confronto tra Listini Fornitori (Ultimo Prezzo)")
             df_comp = pd.read_sql("""
-                SELECT p.descrizione, l.ean, l.fornitore, l.prezzo 
+                SELECT p.descrizione as Prodotto, l.ean as EAN, l.fornitore as Fornitore, l.prezzo as Prezzo
                 FROM listini l JOIN prodotti p ON l.ean = p.ean
                 WHERE l.id IN (SELECT MAX(id) FROM listini GROUP BY ean, fornitore)
             """, conn)
             
             if not df_comp.empty:
-                pivot = df_comp.pivot(index=['ean', 'descrizione'], columns='fornitore', values='prezzo')
-                st.write("Anteprima comparazione (il verde indica il prezzo più basso):")
-                st.dataframe(pivot.style.highlight_min(axis=1, color='lightgreen'))
-                
-                st.download_button("📥 Scarica Excel Comparazione", to_excel_comparazione(pivot), "confronto_fornitori.xlsx")
-            else: st.info("Carica almeno due listini per vedere la comparazione.")
+                pivot = df_comp.pivot(index=['EAN', 'Prodotto'], columns='Fornitore', values='Prezzo')
+                st.write("Comparazione Prezzi d'Acquisto tra Grossisti:")
+                st.dataframe(pivot.style.highlight_min(axis=1, color='#C6EFCE'))
+                st.download_button("📥 Scarica Excel Comparazione", export_excel(pivot.reset_index(), "Confronto"), "comparazione_listini.xlsx")
+            else: st.info("Dati insufficienti per la comparazione.")
 
-    # [Le altre sezioni 🛒 Rilevazione, 📥 Import Listini, ⚙️ Rosetta rimangono come nel post precedente]
-    # ... (copia le funzioni di inserimento e mappatura dal messaggio precedente)
+    # 2. RILEVAZIONE SCAFFALE
+    elif scelta == "🛒 Rilevazione Scaffale":
+        st.title("🛒 Nuova Rilevazione")
+        with st.form("ril"):
+            e_ril = st.text_input("EAN Prodotto")
+            p_ril = st.selectbox("Punto Vendita Rilevato", ["Tigre", "Oasi", "Concorrente", "Altro"])
+            prz = st.number_input("Prezzo Scaffale (€)", format="%.2f")
+            if st.form_submit_button("Registra Rilevazione"):
+                conn.execute("INSERT INTO rilevazioni (ean, punto_vendita, prezzo_scaffale, data_rilevazione) VALUES (?,?,?,?)",
+                             (e_ril, p_ril, prz, datetime.now().strftime('%d/%m/%Y')))
+                conn.commit()
+                upload_db()
+                st.success("Rilevazione salvata correttamente!")
+
+    # 3. IMPORT LISTINI
+    elif scelta == "📥 Import Listini":
+        st.title("📥 Caricamento Listini Grossisti")
+        forn = st.text_input("Fornitore Listino", "Brendolan")
+        f_up = st.file_uploader("PDF o Excel", type=["pdf", "xlsx"])
+        if f_up and st.button("Elabora Listino"):
+            if f_up.name.endswith(".pdf"):
+                with pdfplumber.open(f_up) as pdf:
+                    for page in pdf.pages:
+                        text = page.extract_text()
+                        for line in text.split('\n'):
+                            m_cod = re.search(r'\s(\d{5,6})\s', line)
+                            m_prz = re.search(r'(\d+,\d{2})', line)
+                            if m_cod and m_prz:
+                                cod = m_cod.group(1)
+                                prz = float(m_prz.group(1).replace(',', '.'))
+                                res = conn.execute("SELECT ean FROM mappatura WHERE codice_interno=? AND fornitore=?", (cod, forn)).fetchone()
+                                if res:
+                                    conn.execute("INSERT INTO listini (ean, fornitore, prezzo, data_listino) VALUES (?,?,?,?)", 
+                                                 (res[0], forn, prz, datetime.now().strftime('%Y-%m-%d')))
+                conn.commit()
+                upload_db()
+                st.success("Listino caricato con successo!")
+
+    # 4. ROSETTA
+    elif scelta == "⚙️ Rosetta":
+        st.title("⚙️ Gestione Rosetta")
+        f_ros = st.file_uploader("Excel Rosetta (Col A: Cod. Interno, Col B: Desc, Col C+: EAN)", type="xlsx")
+        if f_ros and st.button("Sincronizza"):
+            df_r = pd.read_excel(f_ros, header=None)
+            for i, row in df_r.iterrows():
+                if i == 0: continue
+                c_int, desc = str(row[0]), str(row[1])
+                for ean in row.iloc[2:].dropna():
+                    e_str = str(ean).split('.')[0].strip()
+                    conn.execute("INSERT INTO prodotti (ean, descrizione, data_immissione) VALUES (?,?,?) ON CONFLICT(ean) DO UPDATE SET descrizione=excluded.descrizione", 
+                                 (e_str, desc, datetime.now().strftime('%Y-%m-%d')))
+                    conn.execute("INSERT OR IGNORE INTO mappatura (ean, fornitore, codice_interno) VALUES (?,?,?)", 
+                                 (e_str, "Brendolan", c_int))
+            conn.commit()
+            upload_db()
+            st.success("Configurazione Rosetta aggiornata!")
