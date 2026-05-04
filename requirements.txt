@@ -5,7 +5,9 @@ pdfplumber
 pydrive2
 pytesseract
 pdf2image
-xlrd
+xlrd==2.0.1
 google-api-python-client
 google-cloud-storage
 google-auth
+google-auth-oauthlib
+google-auth-httplib2
