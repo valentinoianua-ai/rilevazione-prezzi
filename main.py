@@ -139,20 +139,50 @@ if pwd == st.secrets.get("password", "V@l3nt!n0"):
                 st.success("Listino caricato con successo!")
 
     # 4. ROSETTA
-    elif scelta == "⚙️ Rosetta":
-        st.title("⚙️ Gestione Rosetta")
-        f_ros = st.file_uploader("Excel Rosetta (Col A: Cod. Interno, Col B: Desc, Col C+: EAN)", type="xlsx")
-        if f_ros and st.button("Sincronizza"):
-            df_r = pd.read_excel(f_ros, header=None)
-            for i, row in df_r.iterrows():
-                if i == 0: continue
-                c_int, desc = str(row[0]), str(row[1])
-                for ean in row.iloc[2:].dropna():
-                    e_str = str(ean).split('.')[0].strip()
-                    conn.execute("INSERT INTO prodotti (ean, descrizione, data_immissione) VALUES (?,?,?) ON CONFLICT(ean) DO UPDATE SET descrizione=excluded.descrizione", 
-                                 (e_str, desc, datetime.now().strftime('%Y-%m-%d')))
-                    conn.execute("INSERT OR IGNORE INTO mappatura (ean, fornitore, codice_interno) VALUES (?,?,?)", 
-                                 (e_str, "Brendolan", c_int))
-            conn.commit()
-            upload_db()
-            st.success("Configurazione Rosetta aggiornata!")
+   elif scelta == "⚙️ Rosetta":
+        st.title("⚙️ Gestione Mappature (Rosetta)")
+        
+        tab_m1, tab_m2, tab_m3 = st.tabs(["📤 Carica Excel", "💾 Importa Vecchio DB", "📋 Stato Attuale"])
+        
+        with tab_m2:
+            st.subheader("Importazione da Versione Precedente")
+            st.info("Carica qui il file .db della vecchia app per recuperare la mappatura Barcode/Interno.")
+            f_old_db = st.file_uploader("Carica vecchio file .db", type=["db"])
+            
+            if f_old_db and st.button("Esegui Migrazione Dati"):
+                # Salviamo temporaneamente il vecchio DB per leggerlo
+                with open("/tmp/old_app_database.db", "wb") as f:
+                    f.write(f_old_db.getbuffer())
+                
+                try:
+                    old_conn = sqlite3.connect("/tmp/old_app_database.db")
+                    # Cerchiamo di capire come si chiamava la vecchia tabella (es. 'mappatura' o 'prodotti')
+                    old_df = pd.read_sql("SELECT * FROM mappatura", old_conn)
+                    old_conn.close()
+                    
+                    c = conn.cursor()
+                    count_mig = 0
+                    for _, row in old_df.iterrows():
+                        # Adattiamo i nomi delle colonne se nel vecchio DB erano diversi
+                        ean = str(row['ean']).split('.')[0].strip()
+                        cod_int = str(row['codice_interno']).strip()
+                        desc = row['descrizione'] if 'descrizione' in row else f"Prodotto {ean}"
+                        
+                        # Scriviamo nel nuovo DB
+                        c.execute("INSERT OR IGNORE INTO prodotti (ean, descrizione, data_immissione) VALUES (?,?,?)", 
+                                 (ean, desc, datetime.now().strftime('%Y-%m-%d')))
+                        c.execute("INSERT OR IGNORE INTO mappatura (ean, fornitore, codice_interno) VALUES (?,?,?)", 
+                                 (ean, "Brendolan", cod_int))
+                        count_mig += 1
+                    
+                    conn.commit()
+                    upload_db()
+                    st.success(f"Migrazione completata! Recuperati {count_mig} collegamenti.")
+                except Exception as e:
+                    st.error(f"Errore durante la migrazione: {e}. Il vecchio database potrebbe avere una struttura diversa.")
+
+        with tab_m3:
+            # Mostra i primi 100 collegamenti per verifica
+            df_check = pd.read_sql("SELECT * FROM mappatura LIMIT 100", conn)
+            st.write("Anteprima Rosetta attiva:")
+            st.dataframe(df_check)
