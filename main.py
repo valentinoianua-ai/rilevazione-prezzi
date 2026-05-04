@@ -120,50 +120,84 @@ if pwd == st.secrets.get("password", "V@l3nt!n0"):
             upload_db()
             st.success("Listino elaborato!")
 
-    elif scelta == "⚙️ Rosetta":
+  elif scelta == "⚙️ Rosetta":
         st.title("⚙️ Configurazione Rosetta")
-        t_m1, t_m2 = st.tabs(["💾 Importa Vecchio Database (.db)", "📋 Stato Rosetta"])
+        t_m1, t_m2, t_m3 = st.tabs(["💾 Importa Vecchio DB", "📄 Importa Excel (EAN Orizzontali)", "📋 Stato Rosetta"])
         
         with t_m1:
-            st.subheader("Migrazione dati")
-            f_old = st.file_uploader("Carica il file .db", type=["db"])
-            if f_old and st.button("Avvia Importazione"):
+            st.subheader("Migrazione dati da .db")
+            f_old = st.file_uploader("Carica il file .db", type=["db"], key="db_mig")
+            if f_old and st.button("Avvia Migrazione DB"):
                 with open("/tmp/migrazione.db", "wb") as f:
                     f.write(f_old.getbuffer())
                 try:
                     old_conn = sqlite3.connect("/tmp/migrazione.db")
                     cursor = old_conn.cursor()
-                    # Trova automaticamente il nome della tabella nel vecchio DB
                     cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
                     tables = [t[0] for t in cursor.fetchall()]
-                    
                     if tables:
-                        # Prova a leggere dalla prima tabella trovata
                         table_name = tables[0]
                         old_df = pd.read_sql(f"SELECT * FROM {table_name}", old_conn)
                         old_conn.close()
-                        
                         c = conn.cursor()
-                        # Cerchiamo di mappare le colonne dinamicamente
                         col_ean = [c for c in old_df.columns if 'ean' in c.lower()][0]
                         col_int = [c for c in old_df.columns if 'interno' in c.lower() or 'codice' in c.lower()][0]
-                        
                         for _, row in old_df.iterrows():
                             ean = str(row[col_ean]).split('.')[0].strip()
                             cod_int = str(row[col_int]).strip()
                             c.execute("INSERT OR IGNORE INTO prodotti (ean, descrizione) VALUES (?,?)", (ean, f"Migrato {ean}"))
                             c.execute("INSERT OR IGNORE INTO mappatura (ean, fornitore, codice_interno) VALUES (?,?,?)", (ean, "Brendolan", cod_int))
-                        
                         conn.commit()
                         upload_db()
-                        st.success(f"Migrazione completata dalla tabella '{table_name}'!")
-                    else:
-                        st.error("Il file caricato è un database vuoto.")
+                        st.success(f"Migrazione completata da '{table_name}'!")
                 except Exception as e:
-                    st.error(f"Errore: {e}. Assicurati che il file contenga colonne simili a 'ean' e 'codice'.")
+                    st.error(f"Errore: {e}")
 
         with t_m2:
-            df_check = pd.read_sql("SELECT fornitore, codice_interno, ean FROM mappatura LIMIT 200", conn)
-            st.dataframe(df_check)
-else:
-    st.info("Inserisci la password per continuare.")
+            st.subheader("Caricamento da Excel (Maiorana)")
+            st.write("L'Excel deve avere: Col A (Cod. Interno), Col B (Descrizione), Col C in poi (EAN)")
+            f_xl = st.file_uploader("Carica Excel Rosetta", type=["xlsx"], key="xl_ros")
+            
+            if f_xl and st.button("Elabora Excel"):
+                try:
+                    # Leggiamo l'excel saltando l'intestazione se necessario
+                    df_xl = pd.read_excel(f_xl, header=None)
+                    c = conn.cursor()
+                    count_ean = 0
+                    
+                    for i, row in df_xl.iterrows():
+                        if i == 0: continue # Salta intestazione
+                        
+                        cod_maiorana = str(row[0]).strip()
+                        descrizione = str(row[1]).strip()
+                        
+                        # Leggiamo tutte le colonne dalla 2 in poi (gli EAN)
+                        for ean_val in row[2:]:
+                            if pd.notna(ean_val) and str(ean_val).strip() != "":
+                                # Puliamo l'EAN (rimuove .0 se letto come numero)
+                                ean_clean = str(ean_val).split('.')[0].strip()
+                                
+                                # Inseriamo in prodotti
+                                c.execute("INSERT OR IGNORE INTO prodotti (ean, descrizione, data_immissione) VALUES (?,?,?)", 
+                                         (ean_clean, descrizione, datetime.now().strftime('%Y-%m-%d')))
+                                
+                                # Colleghiamo l'EAN al codice interno (usiamo Brendolan come fornitore predefinito)
+                                c.execute("INSERT OR IGNORE INTO mappatura (ean, fornitore, codice_interno) VALUES (?,?,?)", 
+                                         (ean_clean, "Brendolan", cod_maiorana))
+                                count_ean += 1
+                    
+                    conn.commit()
+                    upload_db()
+                    st.success(f"Excel elaborato! Inseriti {count_ean} collegamenti EAN.")
+                except Exception as e:
+                    st.error(f"Errore durante l'elaborazione: {e}")
+
+        with t_m3:
+            st.subheader("Verifica Dati")
+            df_check = pd.read_sql("""
+                SELECT m.codice_interno as 'Cod. Maiorana', p.descrizione, m.ean 
+                FROM mappatura m 
+                JOIN prodotti p ON m.ean = p.ean 
+                LIMIT 500
+            """, conn)
+            st.dataframe(df_check, use_container_width=True)
