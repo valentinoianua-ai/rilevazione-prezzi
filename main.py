@@ -7,43 +7,9 @@ import io
 import os
 from datetime import datetime
 
-# --- CONFIGURAZIONE STORAGE ---
-DB_LOCAL_PATH = "/tmp/database_universale.db"
-BUCKET_NAME = "Archivio Anagrafe EAN"
-
-try:
-    from google.oauth2 import service_account
-    from google.cloud import storage
-    GCP_AVAILABLE = True
-except:
-    GCP_AVAILABLE = False
-
-def get_gcs_client():
-    if GCP_AVAILABLE and "gcp_service_account" in st.secrets:
-        creds = service_account.Credentials.from_account_info(st.secrets["gcp_service_account"])
-        return storage.Client(credentials=creds, project=st.secrets["gcp_service_account"]["project_id"])
-    return None
-
-def download_db():
-    client = get_gcs_client()
-    if client:
-        try:
-            bucket = client.bucket(BUCKET_NAME)
-            blob = bucket.blob("database_prezzi.db")
-            blob.download_to_filename(DB_LOCAL_PATH)
-        except: pass
-
-def upload_db():
-    client = get_gcs_client()
-    if client:
-        try:
-            bucket = client.bucket(BUCKET_NAME)
-            blob = bucket.blob("database_prezzi.db")
-            blob.upload_from_filename(DB_LOCAL_PATH)
-        except: st.error("Errore backup Cloud")
-
-if not os.path.exists(DB_LOCAL_PATH): download_db()
-conn = sqlite3.connect(DB_LOCAL_PATH, check_same_thread=False)
+# --- DATABASE LOCALE ---
+DB_PATH = "database_universale.db"
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
     c = conn.cursor()
@@ -55,6 +21,7 @@ def init_db():
 init_db()
 
 st.set_page_config(page_title="OmniPrice Hub", layout="wide")
+st.sidebar.title("Login")
 pwd = st.sidebar.text_input("Password", type="password")
 
 if pwd == st.secrets.get("password", "V@l3nt!n0"):
@@ -64,7 +31,7 @@ if pwd == st.secrets.get("password", "V@l3nt!n0"):
     # --- FASE 1: ANAGRAFICA EAN ---
     if scelta == "🚀 Setup Anagrafica (EAN)":
         st.title("🚀 Fase 1: Anagrafica Centrale")
-        files = st.file_uploader("Carica Excel Storici Maiorana/Altri", type="xlsx", accept_multiple_files=True)
+        files = st.file_uploader("Carica Excel Storici", type="xlsx", accept_multiple_files=True)
         if files and st.button("Aggiorna Anagrafica"):
             c = conn.cursor()
             for f in files:
@@ -78,53 +45,45 @@ if pwd == st.secrets.get("password", "V@l3nt!n0"):
                             if len(ean) > 7:
                                 c.execute("INSERT OR IGNORE INTO prodotti (ean, descrizione, data_inserimento) VALUES (?,?,?)", (ean, desc, datetime.now().strftime('%Y-%m-%d')))
             conn.commit()
-            upload_db()
-            st.success("Database EAN aggiornato!")
+            st.success("Database EAN aggiornato localmente!")
 
     # --- FASE 2: LEGA FORNITORI ---
     elif scelta == "🔗 Lega Fornitori":
-        st.title("🔗 Fase 2: Mappatura Codici Interni")
-        tab_ex, tab_db = st.tabs(["📄 Carica Excel", "💾 Recupero da .db"])
+        st.title("🔗 Fase 2: Mappatura Codici")
+        tab_ex, tab_db = st.tabs(["📄 Da Excel", "💾 Da file .db"])
         with tab_ex:
-            f_forn = st.text_input("Nome Fornitore (es. Brendolan, Sogegross, ecc.)")
-            f_link = st.file_uploader("Carica Excel (Col A: Cod. Interno | Col B: EAN)", type="xlsx")
+            f_forn = st.text_input("Nome Fornitore (es. Brendolan)")
+            f_link = st.file_uploader("Carica Excel (A: Cod. Interno | B: EAN)", type="xlsx")
             if f_link and f_forn and st.button("Salva Mappatura"):
                 df_l = pd.read_excel(f_link)
-                c = conn.cursor()
                 for _, row in df_l.iterrows():
                     cod, ean = str(row[0]).strip(), str(row[1]).split('.')[0].strip()
-                    c.execute("INSERT OR IGNORE INTO mappatura (codice_interno, fornitore, ean) VALUES (?,?,?)", (cod, f_forn, ean))
+                    conn.execute("INSERT OR IGNORE INTO mappatura (codice_interno, fornitore, ean) VALUES (?,?,?)", (cod, f_forn, ean))
                 conn.commit()
-                upload_db()
                 st.success(f"Mappatura {f_forn} salvata!")
         with tab_db:
             f_db = st.file_uploader("Carica file .db", type="db")
             if f_db and st.button("Estrai da DB"):
-                with open("/tmp/temp_mig.db", "wb") as f: f.write(f_db.getbuffer())
-                old_c = sqlite3.connect("/tmp/temp_mig.db")
+                with open("temp_mig.db", "wb") as f: f.write(f_db.getbuffer())
+                old_c = sqlite3.connect("temp_mig.db")
                 try:
-                    df_old = pd.read_sql("SELECT * FROM link", old_c)
-                    old_c.close()
-                    c = conn.cursor()
+                    df_old = pd.read_sql("SELECT codice_interno, ean FROM link", old_c)
                     for _, row in df_old.iterrows():
-                        c.execute("INSERT OR IGNORE INTO mappatura (codice_interno, fornitore, ean) VALUES (?,?,?)", (str(row['codice_interno']), "Brendolan", str(row['ean']).split('.')[0].strip()))
+                        conn.execute("INSERT OR IGNORE INTO mappatura (codice_interno, fornitore, ean) VALUES (?,?,?)", (str(row[0]), "Brendolan", str(row[1]).split('.')[0].strip()))
                     conn.commit()
-                    upload_db()
-                    st.success("Mappatura Brendolan recuperata dal DB!")
-                except Exception as e: st.error(f"Errore: {e}")
+                    st.success("Mappatura recuperata!")
+                except Exception as e: st.error(f"Errore tabella: {e}")
 
-    # --- FASE 3: IMPORT LISTINI (UNIVERSALE) ---
+    # --- FASE 3: IMPORT LISTINI ---
     elif scelta == "📥 Import Listini":
-        st.title("📥 Fase 3: Caricamento Prezzi Fornitori")
-        tipo = st.selectbox("Formato Listino", ["Excel (Altri Fornitori)", "PDF (Brendolan)"])
-        nome_f = st.text_input("Nome Fornitore (deve corrispondere alla mappatura)", "Brendolan")
-        
-        f_list = st.file_uploader("Carica File Listino")
+        st.title("📥 Fase 3: Caricamento Prezzi")
+        tipo = st.selectbox("Formato", ["Excel (Generico)", "PDF (Brendolan)"])
+        nome_f = st.text_input("Nome Fornitore", "Brendolan")
+        f_list = st.file_uploader("Carica Listino")
         
         if f_list:
             if tipo == "PDF (Brendolan)":
-                if st.button("Elabora Listino PDF"):
-                    c = conn.cursor()
+                if st.button("Elabora PDF"):
                     with pdfplumber.open(f_list) as pdf:
                         for page in pdf.pages:
                             text = page.extract_text()
@@ -134,53 +93,35 @@ if pwd == st.secrets.get("password", "V@l3nt!n0"):
                                     m_prz = re.search(r'(\d+,\d{2})', line)
                                     if m_cod and m_prz:
                                         cod_int, prz = m_cod.group(1), float(m_prz.group(1).replace(',', '.'))
-                                        res = c.execute("SELECT ean FROM mappatura WHERE codice_interno=? AND fornitore=?", (cod_int, nome_f)).fetchall()
+                                        res = conn.execute("SELECT ean FROM mappatura WHERE codice_interno=? AND fornitore=?", (cod_int, nome_f)).fetchall()
                                         for r in res:
-                                            c.execute("INSERT OR REPLACE INTO listini (ean, fornitore, prezzo, data_aggiornamento) VALUES (?,?,?,?)", (r[0], nome_f, prz, datetime.now().strftime('%Y-%m-%d')))
+                                            conn.execute("INSERT OR REPLACE INTO listini (ean, fornitore, prezzo, data_aggiornamento) VALUES (?,?,?,?)", (r[0], nome_f, prz, datetime.now().strftime('%Y-%m-%d')))
                     conn.commit()
-                    upload_db()
-                    st.success(f"Listino {nome_f} (PDF) caricato!")
-            
-            else: # EXCEL PER ALTRI FORNITORI
+                    st.success("Prezzi PDF caricati!")
+            else:
                 df_temp = pd.read_excel(f_list)
-                st.write("Anteprima file:")
-                st.dataframe(df_temp.head(3))
                 cols = df_temp.columns.tolist()
-                col_ean = st.selectbox("Seleziona colonna EAN", cols)
-                col_prz = st.selectbox("Seleziona colonna PREZZO", cols)
-                
-                if st.button("Elabora Listino Excel"):
-                    c = conn.cursor()
-                    count = 0
+                c_ean = st.selectbox("Colonna EAN", cols)
+                c_prz = st.selectbox("Colonna PREZZO", cols)
+                if st.button("Elabora Excel"):
                     for _, row in df_temp.iterrows():
-                        ean = str(row[col_ean]).split('.')[0].strip()
                         try:
-                            prz = float(str(row[col_prz]).replace(',', '.'))
-                            c.execute("INSERT OR REPLACE INTO listini (ean, fornitore, prezzo, data_aggiornamento) VALUES (?,?,?,?)", (ean, nome_f, prz, datetime.now().strftime('%Y-%m-%d')))
-                            count += 1
+                            ean = str(row[c_ean]).split('.')[0].strip()
+                            prz = float(str(row[c_prz]).replace(',', '.'))
+                            conn.execute("INSERT OR REPLACE INTO listini (ean, fornitore, prezzo, data_aggiornamento) VALUES (?,?,?,?)", (ean, nome_f, prz, datetime.now().strftime('%Y-%m-%d')))
                         except: continue
                     conn.commit()
-                    upload_db()
-                    st.success(f"Listino {nome_f} (Excel) caricato: {count} prezzi aggiornati!")
+                    st.success("Prezzi Excel caricati!")
 
     # --- FASE 4: COMPARAZIONE ---
     elif scelta == "📊 COMPARAZIONE":
-        st.title("📊 Tabella Comparativa Listini")
-        query = """
-            SELECT p.ean as EAN, p.descrizione as Prodotto, l.fornitore as Fornitore, l.prezzo as Prezzo
-            FROM prodotti p
-            JOIN listini l ON p.ean = l.ean
-        """
-        df_f = pd.read_sql(query, conn)
+        st.title("📊 Tabella Comparativa")
+        df_f = pd.read_sql("SELECT p.ean, p.descrizione, l.fornitore, l.prezzo FROM prodotti p JOIN listini l ON p.ean = l.ean", conn)
         if not df_f.empty:
-            pivot = df_f.pivot_table(index=['EAN', 'Prodotto'], columns='Fornitore', values='Prezzo')
+            pivot = df_f.pivot_table(index=['ean', 'descrizione'], columns='fornitore', values='prezzo')
             st.dataframe(pivot.style.highlight_min(axis=1, color='#C6EFCE'), use_container_width=True)
-            
-            # Export Excel
             towrite = io.BytesIO()
-            pivot.to_excel(towrite, index=True, engine='openpyxl')
-            st.download_button("📥 Scarica Comparazione in Excel", towrite.getvalue(), "comparazione_prezzi.xlsx")
-        else:
-            st.warning("Nessun dato di listino trovato. Carica i prezzi nella sezione Import.")
+            pivot.to_excel(towrite, index=True)
+            st.download_button("📥 Scarica Excel", towrite.getvalue(), "prezzi.xlsx")
 else:
-    st.info("Inserisci password.")
+    st.info("Password necessaria.")
